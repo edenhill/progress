@@ -1,0 +1,227 @@
+#!/usr/bin/perl -w
+#
+#
+# Copyright (c) 2013  Magnus Edenhill
+#
+# License: Public domain
+
+
+use Cwd qw(getcwd abs_path);
+use Digest::MD5 qw(md5_hex);
+use IO::Handle qw(flush);
+
+$COLOR_BEGIN = "\e[01;32m";
+$COLOR_END   = "\e[00m";
+
+$PROGRESS_PATH = $ENV{"HOME"} . "/.progress";
+
+$mode = "std";
+
+usage($0) unless $#ARGV >= 0;
+
+# progress options
+while ($ARGV[0] =~ /^(-.+)$/) {
+  if ($1 eq "--stats") {
+    $mode = "stats";
+    shift;
+  } else {
+      usage($0);
+  }
+}
+
+@cmd = @ARGV;
+$cmdstr = join(" ", @cmd);
+
+usage($0) if ($cmdstr =~ /^\s*$/);
+
+my $dir = abs_path(getcwd());
+$id = cache_id($dir, @cmd);
+$c = cache_open($id, $dir, $cmdstr);
+
+if ($mode eq "stats") {
+  show_stats($c);
+  exit(0);
+}
+
+if ($cmdstr =~ /menuconfig/) {
+  pr("Interactive make target: not running progress");
+  exit system($cmdstr);
+}
+
+my $last = 0;
+open(PR, "$cmdstr |") or die("Exec: $cmdstr: $!\n");
+while (<PR>) {
+  my $now = time();
+
+  print;
+
+  if ($last + 1 <= $now) {
+    progress_show($c, $now);
+    $last = $now;
+  }
+}
+if (!close(PR)) {
+  $cmdret = $?
+} else {
+  $cmdret = 0;
+}
+
+$c->{end} = time();
+$c->{time} = $c->{end} - $c->{start};
+progress_show_final($c, $c->{time}, $cmdret);
+
+
+
+cache_write($c) unless $cmdret;
+
+
+# print
+sub pr {
+  my ($str) = @_;
+
+  print STDERR ${COLOR_BEGIN} . "progress: " . $str . ${COLOR_END} . "\n";
+}
+
+
+sub progress_show {
+  my ($c, $now) = @_;
+  my $elapsed = $now - $c->{start};
+  my $perc = int(($elapsed*100.0) / $c->{avg});
+
+  my $width = 40;
+  my $x = ($perc/100.0) * $width;
+  $x = $width if ($x > $width);
+  my $prl = ("=" x $x) . (" " x ($width-$x));
+  my $remain = int($c->{avg} - $elapsed);
+  if ($remain < 0) {
+    $remain = "";
+  } else {
+    $remain = ", ${remain} seconds remain";
+  }
+  pr("$elapsed seconds elapsed${remain}, $perc% done: [$prl]");
+}
+
+sub progress_show_final {
+  my ($c, $tot_time, $cmdret) = @_;
+  my $diff = int($tot_time - $c->{avg});
+  my $avgstr = "";
+
+  pr("command exited with error code $cmdret") if $cmdret;
+
+  if ($diff > 5) {
+    $avgstr = " (${diff}s above average)";
+  } elsif ($diff < -5) {
+    $avgstr = " (" . abs(${diff}) . "s below average)";
+  }
+  pr("total time $tot_time seconds$avgstr");
+
+}
+
+
+sub show_stats {
+  my ($c) = @_;
+
+  if (!defined($c->{runs})) {
+    pr("No previous runs");
+    exit(1);
+  }
+
+  open(GP, "| gnuplot") or die("gnuplot: $!\n");
+  print GP "set title \"Run time stats\"\n";
+  print GP "set timefmt \"%s\"\n";
+  print GP "set xlabel \"Date\"\n";
+  print GP "set xdata time\n";
+  print GP "set ylabel \"Build time (seconds)\"\n";
+  print GP "plot '-' using 1:2 with lines\n";
+
+  foreach my $k (@{ $c->{runs} }) {
+    my ($at,$t) = split /:/, $k;
+    print GP "$at $t\n";
+  }
+  print GP "e\n";
+  autoflush GP 1;
+  sleep(5);
+  close(GP);
+
+}
+
+sub cache_id {
+  my ($dir, @cmd) = @_;
+  return md5_hex($dir . ":" . join(' ', @cmd));
+}
+
+
+sub cache_open {
+  my ($id, $pwd, $cmdstr) = @_;
+  my $c = ();
+  my $avg;
+  my $sum = 0;
+  my $cnt = 0;
+
+  $c->{start} = time();
+  $c->{path} = "$PROGRESS_PATH/$id";
+  if (!open(FD, "<" . $c->{path})) {
+    pr("No previous run for $id, defaulting to 60 second average.");
+    $c->{'avg'} = 60;
+    $c->{'pwd'} = $pwd;
+    $c->{'cmd'} = $cmdstr;
+    @{ $c->{runs} } = ();
+    return $c;
+  }
+
+  while (<FD>) {
+    chomp;
+    s/^\s+//g;
+    s/\s+$//g;
+    next if /^\#/;
+
+    if (/^run_(\d+)=(.+)/) {
+      my $at = $1;
+      my $t = $2;
+      push @{ $c->{runs} }, "$at:$t";
+      $sum += $t;
+      $cnt++;
+    }
+  }
+  close(FD);
+
+  if ($cnt > 0) {
+    $avg = $sum / $cnt;
+  } else {
+    $avg = 60;
+  }
+
+  $avg = 1 if ($avg < 1);
+  $c->{avg} = $avg;
+
+  return $c;
+}
+
+sub cache_write {
+  my ($c,$id) = @_;
+  mkdir($PROGRESS_PATH) unless -d $PROGRESS_PATH;
+
+  if (!open(FD, ">>" . $c->{path})) {
+    pr("Failed to open cache entry for writing: " . $c->{path} . ": $!");
+    return;
+  }
+
+  if (defined($c->{'pwd'})) {
+    print FD "pwd=" . $c->{'pwd'} . "\n";
+    print FD "cmd=" . $c->{'cmd'} . "\n";
+  }
+
+  print FD "run_" . $c->{start} . "=" . $c->{time} . "\n";
+
+  close(FD);
+}
+
+
+sub usage {
+    my ($me) = @_;
+    die("Usage: $me [options] <cmd...>\n" .
+	"\n" .
+	" options:\n" .
+	"   --stats  dont execute cmd, just print its previous run stats\n" .
+	"\n");
+}
